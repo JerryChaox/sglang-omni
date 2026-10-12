@@ -1,3 +1,4 @@
+import Carbon
 import XCTest
 @testable import Voxt
 
@@ -89,5 +90,153 @@ final class SettingsPermissionSupportTests: XCTestCase {
             XCTAssertEqual(SettingsPermissionRequirementResolver.requiredPermissions(context: context),
                            notesEnabled ? [.microphone, .accessibility, .reminders] : [.microphone, .accessibility])
         }
+    }
+}
+
+final class BrowserAutomationAccessTests: XCTestCase {
+    func testPassiveChecksNeverRequestConsentOrExecuteScripts() {
+        var requestedConsent: [Bool] = []
+        let access = BrowserAutomationAccess(
+            queryPermission: { _, askUser in
+                requestedConsent.append(askUser)
+                return OSStatus(errAEEventWouldRequireUserConsent)
+            },
+            executeScript: { _ in
+                XCTFail("A passive status check must not execute browser scripts")
+                return .init(output: nil, errorCode: nil)
+            }
+        )
+        XCTAssertEqual(access.permissionStatus(bundleID: "custom.browser"), OSStatus(errAEEventWouldRequireUserConsent))
+        XCTAssertEqual(requestedConsent, [false])
+    }
+
+    func testRequestPerformsOneAuthorizationWithoutURLProbing() {
+        var requestedConsent: [Bool] = []
+        let access = BrowserAutomationAccess(
+            queryPermission: { _, askUser in
+                requestedConsent.append(askUser)
+                return noErr
+            },
+            executeScript: { _ in
+                XCTFail("Authorization must not execute URL or application-name probes")
+                return .init(output: nil, errorCode: nil)
+            }
+        )
+        XCTAssertEqual(access.permissionStatus(bundleID: "browser", askUserIfNeeded: true), noErr)
+        XCTAssertEqual(requestedConsent, [true])
+    }
+
+    func testUnapprovedURLTestNeverExecutesScriptsOrRequestsConsent() {
+        for status in [errAEEventWouldRequireUserConsent, errAEEventNotPermitted, errAEPrivilegeError] {
+            let access = BrowserAutomationAccess(
+                queryPermission: { _, askUser in
+                    XCTAssertFalse(askUser)
+                    return OSStatus(status)
+                },
+                executeScript: { _ in
+                    XCTFail("An unapproved URL test must not send Apple Events")
+                    return .init(output: "unexpected", errorCode: nil)
+                }
+            )
+            let result = access.testURLRead(bundleID: "browser", scripts: ["first", "fallback"])
+            XCTAssertFalse(result.success)
+            XCTAssertEqual(result.permissionDenied, status != errAEEventWouldRequireUserConsent)
+            XCTAssertEqual(result.lastErrorCode, Int(status))
+        }
+    }
+
+    func testAuthorizedURLReadSucceeds() {
+        let access = BrowserAutomationAccess(
+            queryPermission: { _, askUser in
+                XCTAssertFalse(askUser)
+                return noErr
+            },
+            executeScript: { _ in .init(output: "https://example.com", errorCode: nil) }
+        )
+        XCTAssertTrue(access.testURLRead(bundleID: "browser", scripts: ["first"]).success)
+    }
+
+    func testTimeoutPermissionFailureAndClosedAppStopCandidateFallback() {
+        for errorCode in [errAETimeout, errAEEventNotPermitted, errAEPrivilegeError, procNotFound, userCanceledErr] {
+            var executed: [String] = []
+            let access = BrowserAutomationAccess(
+                queryPermission: { _, _ in noErr },
+                executeScript: { source in
+                    executed.append(source)
+                    return .init(output: nil, errorCode: Int(errorCode))
+                }
+            )
+            let result = access.testURLRead(bundleID: "browser", scripts: ["first", "fallback"])
+            XCTAssertFalse(result.success)
+            XCTAssertEqual(result.lastErrorCode, Int(errorCode))
+            XCTAssertEqual(executed, ["first"])
+        }
+    }
+
+    func testUnsupportedURLSyntaxStillAllowsFallback() {
+        var executed: [String] = []
+        let access = BrowserAutomationAccess(
+            queryPermission: { _, _ in noErr },
+            executeScript: { source in
+                executed.append(source)
+                return source == "first"
+                    ? .init(output: nil, errorCode: -1728)
+                    : .init(output: "https://example.com", errorCode: nil)
+            }
+        )
+        XCTAssertTrue(access.testURLRead(bundleID: "browser", scripts: ["first", "fallback"]).success)
+        XCTAssertEqual(executed, ["first", "fallback"])
+    }
+
+    func testUnknownPermissionDoesNotBecomeAuthorized() {
+        let access = BrowserAutomationAccess(
+            queryPermission: { _, _ in OSStatus(errAETimeout) },
+            executeScript: { _ in
+                XCTFail("An unresolved authorization check must not execute scripts")
+                return .init(output: nil, errorCode: nil)
+            }
+        )
+        XCTAssertEqual(access.permissionStatus(bundleID: "browser", askUserIfNeeded: true), OSStatus(errAETimeout))
+        let result = access.testURLRead(bundleID: "browser", scripts: ["first"])
+        XCTAssertFalse(result.success)
+        XCTAssertFalse(result.permissionDenied)
+        XCTAssertEqual(result.lastErrorCode, Int(errAETimeout))
+    }
+
+    func testPermissionAndScriptOperationsNeverOverlap() {
+        let counter = AutomationConcurrencyCounter()
+        let access = BrowserAutomationAccess(
+            queryPermission: { _, _ in
+                counter.performOperation()
+                return noErr
+            },
+            executeScript: { _ in
+                counter.performOperation()
+                return .init(output: "https://example.com", errorCode: nil)
+            }
+        )
+        DispatchQueue.concurrentPerform(iterations: 12) { index in
+            if index.isMultiple(of: 2) {
+                _ = access.permissionStatus(bundleID: "browser", askUserIfNeeded: true)
+            } else {
+                _ = access.testURLRead(bundleID: "browser", scripts: ["first"])
+            }
+        }
+        XCTAssertEqual(counter.maximumConcurrentOperations, 1)
+    }
+}
+
+private final class AutomationConcurrencyCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var activeOperations = 0
+    private(set) var maximumConcurrentOperations = 0
+
+    func performOperation() {
+        lock.withLock {
+            activeOperations += 1
+            maximumConcurrentOperations = max(maximumConcurrentOperations, activeOperations)
+        }
+        Thread.sleep(forTimeInterval: 0.005)
+        lock.withLock { activeOperations -= 1 }
     }
 }
