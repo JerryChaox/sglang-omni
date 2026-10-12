@@ -126,6 +126,49 @@ final class BrowserAutomationAccessTests: XCTestCase {
         XCTAssertEqual(requestedConsent, [true])
     }
 
+    func testRequestDenialReturnsWithoutProbingOrRetrying() {
+        var requestedConsent: [Bool] = []
+        let access = BrowserAutomationAccess(
+            queryPermission: { _, askUser in
+                requestedConsent.append(askUser)
+                return OSStatus(errAEEventNotPermitted)
+            },
+            executeScript: { _ in
+                XCTFail("A denied request must not execute scripts or retry authorization")
+                return .init(output: nil, errorCode: nil)
+            }
+        )
+        XCTAssertEqual(access.permissionStatus(bundleID: "browser", askUserIfNeeded: true), OSStatus(errAEEventNotPermitted))
+        XCTAssertEqual(requestedConsent, [true])
+    }
+
+    func testCancelledOperationsNeverReachNativeAPI() async {
+        let gate = DispatchSemaphore(value: 0)
+        let access = BrowserAutomationAccess(
+            queryPermission: { _, _ in
+                XCTFail("A cancelled operation must not query or request permission")
+                return noErr
+            },
+            executeScript: { _ in
+                XCTFail("A cancelled operation must not execute scripts")
+                return .init(output: nil, errorCode: nil)
+            }
+        )
+        let task = Task.detached {
+            gate.wait()
+            return (
+                access.permissionStatus(bundleID: "browser", askUserIfNeeded: true),
+                access.testURLRead(bundleID: "browser", scripts: ["first", "fallback"])
+            )
+        }
+        task.cancel()
+        gate.signal()
+        let (status, result) = await task.value
+        XCTAssertEqual(status, OSStatus(userCanceledErr))
+        XCTAssertFalse(result.success)
+        XCTAssertEqual(result.lastErrorCode, Int(userCanceledErr))
+    }
+
     func testUnapprovedURLTestNeverExecutesScriptsOrRequestsConsent() {
         for status in [errAEEventWouldRequireUserConsent, errAEEventNotPermitted, errAEPrivilegeError] {
             let access = BrowserAutomationAccess(
@@ -201,6 +244,47 @@ final class BrowserAutomationAccessTests: XCTestCase {
         XCTAssertFalse(result.success)
         XCTAssertFalse(result.permissionDenied)
         XCTAssertEqual(result.lastErrorCode, Int(errAETimeout))
+    }
+
+    func testPendingNativeConsentDoesNotBlockOrDuplicateLaterOperations() async {
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let initialCall = DispatchSemaphore(value: 1)
+        defer { initialCall.signal() }
+        let access = BrowserAutomationAccess(
+            queryPermission: { _, askUser in
+                XCTAssertTrue(askUser, "Only the initial explicit request should reach the native API")
+                if initialCall.wait(timeout: .now()) == .success {
+                    entered.signal()
+                    release.wait()
+                } else {
+                    XCTFail("A pending native request must not be duplicated")
+                }
+                return OSStatus(errAEEventNotPermitted)
+            },
+            executeScript: { _ in
+                XCTFail("No scripts should run while native consent is pending")
+                return .init(output: nil, errorCode: nil)
+            }
+        )
+        let pending = Task.detached { access.permissionStatus(bundleID: "browser", askUserIfNeeded: true) }
+        XCTAssertEqual(entered.wait(timeout: .now() + 2), .success)
+        pending.cancel()
+        let laterOperationsReturned = expectation(description: "Later operations return while native consent is pending")
+        let later = Task.detached {
+            XCTAssertEqual(access.permissionStatus(bundleID: "browser"), OSStatus(errAETimeout))
+            XCTAssertEqual(access.permissionStatus(bundleID: "browser", askUserIfNeeded: true), OSStatus(errAETimeout))
+            let result = access.testURLRead(bundleID: "browser", scripts: ["first", "fallback"])
+            XCTAssertFalse(result.success)
+            XCTAssertFalse(result.permissionDenied)
+            XCTAssertEqual(result.lastErrorCode, Int(errAETimeout))
+            laterOperationsReturned.fulfill()
+        }
+        // Bounded so the previous blocking implementation fails without hanging the test runner.
+        await fulfillment(of: [laterOperationsReturned], timeout: 1)
+        release.signal()
+        _ = await pending.value
+        await later.value
     }
 
     func testPermissionAndScriptOperationsNeverOverlap() {
